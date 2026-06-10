@@ -530,7 +530,7 @@ function initSchema(db: Database.Database): void {
   ensureColumn(db, "uno_games", "pending_draw4", "INTEGER DEFAULT 0");
   ensureColumn(db, "uno_games", "uno_called", "TEXT DEFAULT '[]'");
 
-  // Cards: source tag for shoob-imported cards
+  // Cards: source tag for API-imported cards
   ensureColumn(db, "cards", "source", "TEXT DEFAULT ''");
 
   db.exec(`
