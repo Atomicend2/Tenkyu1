@@ -1017,7 +1017,7 @@ async function dispatch(ctx: CommandContext): Promise<void> {
     case "addinv":
     case "rules":
     case "addrole":
-    case "fetchshoob":
+    case "fetchcards":
       return handleStaff(ctx);
 
     case "cds":
