@@ -12,6 +12,9 @@ const uploadMem = multer({ storage: multer.memoryStorage(), limits: { fileSize: 
 const ANIMATED_TIERS = new Set(["T6", "TS", "TX", "TZ"]); // must match VIDEO_TIERS in utils.ts
 const VALID_TIERS = ["T1","T2","T3","T4","T5","T6","TS","TX","TZ"];
 
+// Eclipse Anime Card API base URL
+const ECLIPSE_API = "https://host.eclipse.name.ng";
+
 // Serve card media BLOB from the database (image or video for animated tiers)
 router.get("/:id/image", (req, res) => {
   const db = getDb();
@@ -236,7 +239,6 @@ router.post("/upload", requireAuth, uploadMem.single("file"), async (req: AuthRe
     const mimeType = req.file.mimetype;
     const isVideo = mimeType.startsWith("video/");
 
-    // For animated tiers accept video; for static tiers accept image
     if (isAnimated && !isVideo && !mimeType.startsWith("image/")) {
       res.status(400).json({ success: false, message: "Animated tier cards require a video or image file." });
       return;
@@ -248,7 +250,6 @@ router.post("/upload", requireAuth, uploadMem.single("file"), async (req: AuthRe
 
     let imageData: Buffer = req.file.buffer;
 
-    // Optionally resize static images to save DB space
     if (!isVideo) {
       try {
         const sharp = (await import("sharp")).default;
@@ -277,12 +278,11 @@ router.post("/upload", requireAuth, uploadMem.single("file"), async (req: AuthRe
 });
 
 
-// ── Shoob.gg card import (staff only) ────────────────────────────────────────
-// POST /api/v1/cards/fetch-shoob
-// Body: { tier?, series?, anime?, limit?, useLatest? }
+// ── Eclipse Anime Card API import (staff only) ────────────────────────────────
+// POST /api/v1/cards/fetch-cards
+// Body: { tier?, series?, anime?, event?, limit?, useLatest? }
 //
-// Uses the free public Anime Card API (host.eclipse.name.ng) which scrapes
-// Shoob.gg every hour — NO session cookie or auth required.
+// Uses the Eclipse Anime Card API (host.eclipse.name.ng).
 //
 // Tier mapping (API uses numbers, bot uses T-prefix):
 //   "1"→T1, "2"→T2, "3"→T3, "4"→T4, "5"→T5, "6"→T6
@@ -292,10 +292,9 @@ router.post("/upload", requireAuth, uploadMem.single("file"), async (req: AuthRe
 //   tier      - "T1"–"T6" to filter by tier (optional; imports all tiers if omitted)
 //   series    - override series label for all imported cards (optional)
 //   anime     - search cards by anime/character name on the API (optional)
+//   event     - fetch event cards e.g. "Christmas", "Halloween", "Summer", "Gala" (optional)
 //   limit     - max cards to import, 1–200 (default 20)
 //   useLatest - if true, fetches /api/latest instead of /api/cards (default false)
-
-const ECLIPSE_API = "https://host.eclipse.name.ng";
 
 // Converts bot tier (T1–T6) to the API's numeric tier string (1–6).
 function botTierToApiTier(botTier: string): string | null {
@@ -306,7 +305,6 @@ function botTierToApiTier(botTier: string): string | null {
 }
 
 // Converts API numeric tier back to bot tier format.
-// Falls back to the requested tier if the card has a different tier number.
 function apiTierToBotTier(apiTier: string | number | undefined, fallback: string): string {
   const map: Record<string, string> = {
     "1": "T1", "2": "T2", "3": "T3", "4": "T4", "5": "T5", "6": "T6",
@@ -314,7 +312,73 @@ function apiTierToBotTier(apiTier: string | number | undefined, fallback: string
   return map[String(apiTier ?? "")] ?? fallback;
 }
 
-router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
+// Fetch scraper status from Eclipse API
+router.get("/scraper/status", requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) { res.status(401).json({ success: false, message: "Not authenticated" }); return; }
+    const staffRow = getStaff(userId);
+    const BOT_OWNER = (process.env["OWNER_NUMBERS"] || process.env["BOT_OWNER_LID"] || "2348144550593").split(",")[0].replace(/\D/g, "");
+    const isStaff = !!staffRow || userId.replace(/\D/g, "") === BOT_OWNER;
+    if (!isStaff) { res.status(403).json({ success: false, message: "Only staff can access scraper status." }); return; }
+
+    const apiRes = await fetch(`${ECLIPSE_API}/api/scraper/status`, {
+      headers: { "Accept": "application/json" },
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await apiRes.json();
+    res.json(data);
+  } catch (err: any) {
+    logger.error({ err }, "Scraper status error");
+    res.status(502).json({ success: false, message: err?.message || "Failed to fetch scraper status" });
+  }
+});
+
+// Trigger scraper run
+router.post("/scraper/run", requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) { res.status(401).json({ success: false, message: "Not authenticated" }); return; }
+    const staffRow = getStaff(userId);
+    const BOT_OWNER = (process.env["OWNER_NUMBERS"] || process.env["BOT_OWNER_LID"] || "2348144550593").split(",")[0].replace(/\D/g, "");
+    const isStaff = !!staffRow || userId.replace(/\D/g, "") === BOT_OWNER;
+    if (!isStaff) { res.status(403).json({ success: false, message: "Only staff can trigger scraper." }); return; }
+
+    const apiRes = await fetch(`${ECLIPSE_API}/api/scraper/run`, {
+      headers: { "Accept": "application/json" },
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await apiRes.json();
+    res.json(data);
+  } catch (err: any) {
+    logger.error({ err }, "Scraper run error");
+    res.status(502).json({ success: false, message: err?.message || "Failed to trigger scraper" });
+  }
+});
+
+// Fetch scraper history
+router.get("/scraper/history", requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) { res.status(401).json({ success: false, message: "Not authenticated" }); return; }
+    const staffRow = getStaff(userId);
+    const BOT_OWNER = (process.env["OWNER_NUMBERS"] || process.env["BOT_OWNER_LID"] || "2348144550593").split(",")[0].replace(/\D/g, "");
+    const isStaff = !!staffRow || userId.replace(/\D/g, "") === BOT_OWNER;
+    if (!isStaff) { res.status(403).json({ success: false, message: "Only staff can view scraper history." }); return; }
+
+    const apiRes = await fetch(`${ECLIPSE_API}/api/scraper/history`, {
+      headers: { "Accept": "application/json" },
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await apiRes.json();
+    res.json(data);
+  } catch (err: any) {
+    logger.error({ err }, "Scraper history error");
+    res.status(502).json({ success: false, message: err?.message || "Failed to fetch scraper history" });
+  }
+});
+
+router.post("/fetch-cards", requireAuth, async (req: AuthRequest, res) => {
   try {
     const userId = req.user?.id;
     if (!userId) { res.status(401).json({ success: false, message: "Not authenticated" }); return; }
@@ -324,26 +388,25 @@ router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
     const isStaff = !!staffRow || userId.replace(/\D/g, "") === BOT_OWNER;
     if (!isStaff) { res.status(403).json({ success: false, message: "Only staff can import cards." }); return; }
 
-    // tier is optional — if omitted, we import cards from all tiers.
     const rawTier = (req.body?.tier as string | undefined)?.toUpperCase().trim() || "";
-    const tier = rawTier || "";  // empty string = no tier filter on our side
+    const tier = rawTier || "";
 
     if (tier && !VALID_TIERS.includes(tier)) {
       res.status(400).json({ success: false, message: `Invalid tier. Valid: ${VALID_TIERS.join(", ")} (or leave blank for all tiers)` });
       return;
     }
 
-    // TS/TX/TZ can't come from this API — block early with a clear message.
     if (tier === "TS" || tier === "TX" || tier === "TZ") {
       res.status(400).json({
         success: false,
-        message: `${tier} cards are not available via the Shoob.gg public API. Upload ${tier} cards manually via the card upload panel.`,
+        message: `${tier} cards are not available via the public API. Upload ${tier} cards manually via the card upload panel.`,
       });
       return;
     }
 
     const seriesOverride = ((req.body?.series || "") as string).trim();
     const animeFilter   = ((req.body?.anime  || "") as string).trim();
+    const eventFilter   = ((req.body?.event  || "") as string).trim();
     const limit         = Math.min(parseInt(req.body?.limit || "20", 10) || 20, 200);
     const useLatest     = req.body?.useLatest === true || req.body?.useLatest === "true";
 
@@ -351,13 +414,16 @@ router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
     const isAnimated = tier ? ANIMATED_TIERS.has(tier) : false;
 
     // ── Build the API URL ─────────────────────────────────────────────────────
-    // Priority: useLatest → /api/latest, else /api/cards with optional filters.
     let apiUrl: string;
-    if (useLatest) {
+    if (eventFilter) {
+      // Event cards: /api/events?name=Christmas
+      apiUrl = `${ECLIPSE_API}/api/events?name=${encodeURIComponent(eventFilter)}`;
+    } else if (useLatest) {
+      // Latest cards: /api/latest
       apiUrl = `${ECLIPSE_API}/api/latest?limit=${Math.min(limit, 200)}`;
     } else {
+      // Standard card fetch with optional filters
       const params = new URLSearchParams();
-      // Map T-prefix tier to numeric tier for the API
       const apiTier = tier ? botTierToApiTier(tier) : null;
       if (apiTier) params.set("tier", apiTier);
       if (animeFilter) params.set("anime", animeFilter);
@@ -365,7 +431,7 @@ router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
       apiUrl = `${ECLIPSE_API}/api/cards${qs ? `?${qs}` : ""}`;
     }
 
-    logger.info({ apiUrl }, "Fetching cards from Anime Card API");
+    logger.info({ apiUrl }, "Fetching cards from Eclipse Anime Card API");
 
     const apiRes = await fetch(apiUrl, {
       headers: { "Accept": "application/json" },
@@ -375,7 +441,7 @@ router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
     if (!apiRes.ok) {
       res.status(502).json({
         success: false,
-        message: `Anime Card API returned ${apiRes.status} ${apiRes.statusText}. Try again in a moment.`,
+        message: `Eclipse API returned ${apiRes.status} ${apiRes.statusText}. Try again in a moment.`,
       });
       return;
     }
@@ -385,14 +451,16 @@ router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
     // Response shape: { success, count, data: [...] } or just an array
     const rawCards: any[] = Array.isArray(apiData)
       ? apiData
-      : (apiData.data || apiData.cards || []);
+      : (apiData.data || apiData.cards || apiData.results || []);
 
     if (!rawCards.length) {
       res.status(502).json({
         success: false,
-        message: animeFilter
-          ? `No cards found for anime "${animeFilter}"${tier ? ` at tier ${tier}` : ""}. Try a different search.`
-          : "No cards returned from the API. Try a different filter.",
+        message: eventFilter
+          ? `No cards found for event "${eventFilter}". Try: Christmas, Halloween, Summer, Gala.`
+          : animeFilter
+            ? `No cards found for anime "${animeFilter}"${tier ? ` at tier ${tier}` : ""}. Try a different search.`
+            : "No cards returned from the API. Try a different filter.",
       });
       return;
     }
@@ -402,21 +470,14 @@ router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
     const errors: string[] = [];
 
     for (const sc of rawCards.slice(0, limit)) {
-      // The API returns: { title, url, series, tier }
       const cardName: string = (sc.title || sc.name || sc.card_name || "").trim();
-      const cardSeries: string = seriesOverride || (sc.series || sc.anime || sc.source || "Shoob").trim() || "Shoob";
-
-      // Use the card's actual tier from the API, mapped to bot format.
-      // Falls back to the requested tier (or T1 if no tier was specified).
+      const cardSeries: string = seriesOverride || (sc.series || sc.anime || sc.source || eventFilter || "Eclipse").trim() || "Eclipse";
       const cardTier: string = apiTierToBotTier(sc.tier, tier || "T1");
-
-      // Image/video URL — the API uses the field name "url"
       const mediaUrl: string = (sc.url || sc.image || sc.imageUrl || sc.image_url || sc.video || sc.videoUrl || sc.media_url || "").trim();
       const isVideo = /\.(mp4|webm|mov)(\?|$)/i.test(mediaUrl);
 
       if (!cardName || cardName.length < 2) { skipped++; continue; }
 
-      // Skip duplicates
       const existing = db.prepare("SELECT id FROM cards WHERE LOWER(name) = LOWER(?)").get(cardName) as any;
       if (existing) { skipped++; continue; }
 
@@ -448,21 +509,21 @@ router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
 
       const cardIsAnimated = isVideo ? 1 : (ANIMATED_TIERS.has(cardTier) ? 1 : 0);
       db.prepare(
-        "INSERT INTO cards (name, series, tier, image_data, is_animated, uploaded_by, source) VALUES (?, ?, ?, ?, ?, ?, 'shoob.gg')"
+        "INSERT INTO cards (name, series, tier, image_data, is_animated, uploaded_by, source) VALUES (?, ?, ?, ?, ?, ?, 'eclipse-api')"
       ).run(cardName, cardSeries, cardTier, imageData, cardIsAnimated, userId);
       imported++;
     }
 
     res.json({
       success: true,
-      message: `Shoob.gg import complete: ${imported} imported, ${skipped} skipped${errors.length ? ` (${errors.length} image errors)` : ""}.`,
+      message: `Import complete: ${imported} imported, ${skipped} skipped${errors.length ? ` (${errors.length} image errors)` : ""}.`,
       imported,
       skipped,
       total_available: rawCards.length,
       errors: errors.slice(0, 10),
     });
   } catch (err: any) {
-    logger.error({ err }, "Shoob fetch error");
+    logger.error({ err }, "Card fetch error");
     res.status(500).json({ success: false, message: err?.message || "Fetch failed" });
   }
 });
