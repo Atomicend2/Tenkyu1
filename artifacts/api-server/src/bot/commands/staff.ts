@@ -604,24 +604,27 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
     return;
   }
 
-  // ── .fetchshoob ───────────────────────────────────────────────────────────
-  // Imports cards from the free Anime Card API (no session cookie needed).
+  // ── .fetchcards ───────────────────────────────────────────────────────────
+  // Imports cards from the Eclipse Anime Card API (host.eclipse.name.ng).
   //
   // Usage:
-  //   .fetchshoob [tier] [anime] [limit]
-  //   .fetchshoob latest [limit]
+  //   .fetchcards [tier] [anime] [limit]
+  //   .fetchcards latest [limit]
+  //   .fetchcards event [EventName] [limit]
   //
   // Examples:
-  //   .fetchshoob T5 Naruto 30        ← T5 cards from Naruto
-  //   .fetchshoob T3 "One Piece" 50   ← T3 One Piece cards
-  //   .fetchshoob latest 40           ← 40 most recently scraped cards
-  //   .fetchshoob T6                  ← 20 T6 cards (default limit)
+  //   .fetchcards T5 Naruto 30           ← T5 cards from Naruto
+  //   .fetchcards T3 "One Piece" 50      ← T3 One Piece cards
+  //   .fetchcards latest 40              ← 40 most recently scraped cards
+  //   .fetchcards event Christmas 20     ← Christmas event cards
+  //   .fetchcards event Halloween        ← Halloween event cards
+  //   .fetchcards T6                     ← 20 T6 cards (default limit)
   //
   // Tier mapping: T1=1, T2=2, T3=3, T4=4, T5=5, T6=6
   // TS/TX/TZ are not available via this API — upload those manually.
-  if (cmd === "fetchshoob") {
+  if (cmd === "fetchcards") {
     if (!isModOrAbove(ctx)) {
-      await sendText(from, "❌ Only mods and above can import cards from Shoob.");
+      await sendText(from, "❌ Only mods and above can import cards.");
       return;
     }
 
@@ -638,22 +641,35 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
       "1": "T1", "2": "T2", "3": "T3", "4": "T4", "5": "T5", "6": "T6",
     };
 
-    // Parse args: .fetchshoob [tier|latest] [anime] [limit]
+    // Parse args: .fetchcards [tier|latest|event] [anime/eventName] [limit]
     const firstArg = (args[0] || "").toUpperCase();
     const useLatest = firstArg === "LATEST";
+    const useEvent = firstArg === "EVENT";
 
     let tier = "";
     let animeFilter = "";
+    let eventName = "";
     let limit = 20;
 
     if (useLatest) {
-      // .fetchshoob latest [limit]
       limit = Math.min(parseInt(args[1] || "20", 10) || 20, 200);
+    } else if (useEvent) {
+      // .fetchcards event [EventName] [limit]
+      const lastArg = args[args.length - 1];
+      const lastIsNum = args.length > 2 && /^\d+$/.test(lastArg);
+      if (lastIsNum) {
+        limit = Math.min(parseInt(lastArg, 10) || 20, 200);
+        eventName = args.slice(1, -1).join(" ").trim();
+      } else {
+        eventName = args.slice(1).join(" ").trim();
+      }
+      if (!eventName) {
+        await sendText(from, `❌ Usage: *.fetchcards event [name] [limit]*\nExamples: *.fetchcards event Christmas 20*\nAvailable events: Christmas, Halloween, Summer, Gala`);
+        return;
+      }
     } else {
-      // .fetchshoob [tier] [anime] [limit]
       if (firstArg && VALID_TIERS_FETCH.includes(firstArg)) {
         tier = firstArg;
-        // Check if last arg is a number → it's the limit
         const lastArg = args[args.length - 1];
         const lastIsNum = args.length > 1 && /^\d+$/.test(lastArg);
         if (lastIsNum) {
@@ -666,16 +682,17 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
         await sendText(from, `❌ *${firstArg}* cards aren't available from the public API.\nUpload ${firstArg} cards manually via *.ubs* (reply to image).`);
         return;
       } else if (firstArg) {
-        await sendText(from, `❌ Invalid tier *${firstArg}*.\nValid: ${VALID_TIERS_FETCH.join(", ")} or *latest*\n\nUsage: *.fetchshoob [tier] [anime] [limit]*\nExample: *.fetchshoob T5 Naruto 30*`);
+        await sendText(from, `❌ Invalid option *${firstArg}*.\n\nUsage:\n• *.fetchcards [tier] [anime] [limit]*\n• *.fetchcards latest [limit]*\n• *.fetchcards event [name] [limit]*\n\nExample: *.fetchcards T5 Naruto 30*`);
         return;
       } else {
-        limit = 20;  // bare .fetchshoob → fetch latest 20
+        limit = 20;
       }
     }
 
     // Build status message
-    let statusMsg = `🌐 Fetching cards from Anime Card API...\n`;
-    if (useLatest) statusMsg += `_Mode: latest | Limit: ${limit}_`;
+    let statusMsg = `🌐 Fetching cards from Eclipse Anime Card API...\n`;
+    if (useEvent) statusMsg += `_Mode: event | Event: ${eventName} | Limit: ${limit}_`;
+    else if (useLatest) statusMsg += `_Mode: latest | Limit: ${limit}_`;
     else statusMsg += `_Tier: ${tier || "any"} | Anime: ${animeFilter || "any"} | Limit: ${limit}_`;
     await sendText(from, statusMsg);
 
@@ -685,7 +702,9 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
 
       // ── Build API URL ────────────────────────────────────────────────────
       let apiUrl: string;
-      if (useLatest) {
+      if (useEvent) {
+        apiUrl = `${ECLIPSE_API_BOT}/api/events?name=${encodeURIComponent(eventName)}`;
+      } else if (useLatest) {
         apiUrl = `${ECLIPSE_API_BOT}/api/latest?limit=${limit}`;
       } else {
         const params = new URLSearchParams();
@@ -701,7 +720,7 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
       });
 
       if (!apiRes.ok) {
-        await sendText(from, `❌ Anime Card API returned HTTP ${apiRes.status}. Try again in a moment.`);
+        await sendText(from, `❌ Eclipse API returned HTTP ${apiRes.status}. Try again in a moment.`);
         return;
       }
 
@@ -712,7 +731,11 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
         : (apiData.data || apiData.cards || apiData.results || []);
 
       if (!rawCards.length) {
-        const hint = animeFilter ? `No cards found for *"${animeFilter}"*${tier ? ` (tier ${tier})` : ""}. Try a different anime name.` : "No cards returned. Try with a specific anime name.";
+        const hint = useEvent
+          ? `No cards found for event *"${eventName}"*. Try: Christmas, Halloween, Summer, Gala`
+          : animeFilter
+            ? `No cards found for *"${animeFilter}"*${tier ? ` (tier ${tier})` : ""}. Try a different anime name.`
+            : "No cards returned. Try with a specific anime name or event.";
         await sendText(from, `❌ ${hint}`);
         return;
       }
@@ -736,8 +759,9 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
       for (const sc of rawCards.slice(0, limit)) {
         // Eclipse API fields: { title, url, series, tier }
         const cardName: string = (sc.title || sc.name || sc.id || sc.card_name || "").trim().replace(/_/g, " ");
-        const mediaUrl: string = (sc.url || sc.image || sc.imageUrl || sc.image_url || sc.video || sc.videoUrl || "").trim();
-        const cardSeries: string = (sc.series || sc.anime || sc.source || animeFilter || "Shoob").trim() || "Shoob";
+        const mediaUrl: string = (sc.url || sc.image || sc.imageUrl || sc.image_url || sc.video || sc.videoUrl || sc.media_url || "").trim();
+        const defaultSeries = useEvent ? eventName : (animeFilter || "Eclipse");
+        const cardSeries: string = (sc.series || sc.anime || sc.source || defaultSeries).trim() || "Eclipse";
 
         // Use the card's own tier from the API; fall back to what the user requested
         const cardTier: string = numToTier[String(sc.tier ?? "")] ?? (tier || "T1");
@@ -780,7 +804,7 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
         const uploaderPhone = sender.split("@")[0].split(":")[0];
         const newCardId = genCardId();
         db.prepare(
-          "INSERT INTO cards (id, name, series, tier, image_data, is_animated, uploaded_by, source) VALUES (?, ?, ?, ?, ?, ?, ?, 'shoob.gg')"
+          "INSERT INTO cards (id, name, series, tier, image_data, is_animated, uploaded_by, source) VALUES (?, ?, ?, ?, ?, ?, ?, 'eclipse-api')"
         ).run(newCardId, cardName, cardSeries, cardTier, imageData, cardIsAnimated, uploaderPhone);
         imported++;
       }
@@ -790,6 +814,7 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
         `🎴 Imported: *${imported}* cards\n` +
         `⏭️ Skipped (duplicates): *${skipped}*\n` +
         `📊 Total in batch: *${rawCards.length}*\n` +
+        (useEvent ? `🎉 Event: *${eventName}*\n` : "") +
         (tier ? `⭐ Tier: *${tier}*\n` : "") +
         (animeFilter ? `📺 Anime: *${animeFilter}*\n` : "");
       if (errors.length > 0) {
@@ -798,7 +823,7 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
       }
       await sendText(from, summary);
     } catch (err: any) {
-      await sendText(from, `❌ Import failed: ${err?.message || "Unknown error"}`);
+      await sendText(from, `❌ Card import failed: ${err?.message || "Unknown error"}`);
     }
     return;
   }
@@ -814,5 +839,5 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
     return;
   }
 
-  await sendText(from, `❌ Unknown staff command: *.${cmd}*\n\nAvailable: bots, modlist, addmod, addguardian, removeguardian, removemod, recruit, addpremium, removepremium, ban, unban, banlist, post, join, exit, show, dc, ac, rc, upload, rules, resetbal, reset, addinv, setms, delms, website`);
+  await sendText(from, `❌ Unknown staff command: *.${cmd}*\n\nAvailable: bots, modlist, addmod, addguardian, removeguardian, removemod, recruit, addpremium, removepremium, ban, unban, banlist, post, join, exit, show, dc, ac, rc, upload, rules, resetbal, reset, addinv, setms, delms, fetchcards, website`);
 }
