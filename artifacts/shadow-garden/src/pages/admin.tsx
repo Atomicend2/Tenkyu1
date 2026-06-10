@@ -781,7 +781,7 @@ function AdminDashboard({ token, base, onLogout, toast }: {
       {/* ── CARDS TAB ── */}
       {activeTab === "cards" && (
         <div className="space-y-6">
-          <ShoobImportPanel />
+          <CardImportPanel />
         </div>
       )}
 
@@ -958,29 +958,85 @@ function AdminFramesPanel({ token, base, toast }: { token: string; base: string;
 }
 
 
-function ShoobImportPanel() {
+function CardImportPanel() {
   const { toast } = useToast();
   const token = getAdminToken();
+
+  // ── Import form state ──────────────────────────────────────────────────
+  const [importMode, setImportMode] = useState<"anime" | "event" | "latest" | "tier">("anime");
   const [tier, setTier] = useState("T3");
-  const [series, setSeries] = useState("Shoob");
+  const [anime, setAnime] = useState("");
+  const [eventName, setEventName] = useState("Christmas");
+  const [series, setSeries] = useState("");
   const [limit, setLimit] = useState("20");
-  const [page, setPage] = useState("1");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<any>(null);
 
-  const VALID_TIERS = ["T1","T2","T3","T4","T5","T6","TS","TX","TZ"];
+  // ── Scraper state ──────────────────────────────────────────────────────
+  const [scraperStatus, setScraperStatus] = useState<any>(null);
+  const [scraperHistory, setScraperHistory] = useState<any[]>([]);
+  const [scraperLoading, setScraperLoading] = useState(false);
+  const [runLoading, setRunLoading] = useState(false);
 
-  const handleFetch = async () => {
+  const VALID_TIERS = ["T1","T2","T3","T4","T5","T6"];
+  const EVENT_OPTIONS = ["Christmas", "Halloween", "Summer", "Gala"];
+
+  const authHeader = token ? { Authorization: `Bearer ${token}` } : {};
+
+  const fetchScraperStatus = async () => {
+    setScraperLoading(true);
+    try {
+      const res = await fetch("/api/v1/cards/scraper/status", { headers: { ...authHeader } });
+      const j = await res.json();
+      setScraperStatus(j);
+      const hRes = await fetch("/api/v1/cards/scraper/history", { headers: { ...authHeader } });
+      const hj = await hRes.json();
+      setScraperHistory(Array.isArray(hj) ? hj : (hj.data || hj.history || []));
+    } catch (e: any) {
+      toast({ title: "Scraper Error", description: e?.message || "Failed to fetch status", variant: "destructive" });
+    } finally {
+      setScraperLoading(false);
+    }
+  };
+
+  const triggerScraperRun = async () => {
+    setRunLoading(true);
+    try {
+      const res = await fetch("/api/v1/cards/scraper/run", { method: "POST", headers: { ...authHeader } });
+      const j = await res.json();
+      toast({ title: j.success !== false ? "✅ Scraper Triggered" : "❌ Failed", description: j.message || "Scraper run initiated." });
+      setTimeout(fetchScraperStatus, 2000);
+    } catch (e: any) {
+      toast({ title: "Error", description: e?.message || "Failed to trigger scraper", variant: "destructive" });
+    } finally {
+      setRunLoading(false);
+    }
+  };
+
+  const handleImport = async () => {
     setLoading(true);
     setResult(null);
     try {
-      const res = await fetch("/api/v1/cards/fetch-shoob", {
+      const body: any = { limit: parseInt(limit, 10) || 20 };
+      if (importMode === "latest") {
+        body.useLatest = true;
+      } else if (importMode === "event") {
+        body.event = eventName;
+        if (series.trim()) body.series = series.trim();
+      } else if (importMode === "tier") {
+        body.tier = tier;
+        if (series.trim()) body.series = series.trim();
+      } else {
+        // anime mode
+        body.anime = anime.trim();
+        if (tier) body.tier = tier;
+        if (series.trim()) body.series = series.trim();
+      }
+
+      const res = await fetch("/api/v1/cards/fetch-cards", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ tier, series, limit: parseInt(limit, 10) || 20, page: parseInt(page, 10) || 1 }),
+        headers: { "Content-Type": "application/json", ...authHeader },
+        body: JSON.stringify(body),
       });
       const j = await res.json();
       setResult(j);
@@ -997,77 +1053,203 @@ function ShoobImportPanel() {
   };
 
   return (
-    <section className="glass-card rounded-xl p-6 border border-sky-500/20">
-      <h2 className="font-serif text-xl font-bold text-white mb-1 flex items-center gap-2">
-        <Download className="w-5 h-5 text-sky-400" /> Import Cards from Shoob.gg
-      </h2>
-      <p className="text-muted-foreground text-sm mb-6">
-        Fetch card data (name, series, image/video) directly from{" "}
-        <a href="https://shoob.gg/cards" target="_blank" rel="noreferrer" className="text-sky-400 underline">shoob.gg/cards</a>{" "}
-        and import them into your card database. Images and videos are downloaded and stored locally.
-      </p>
+    <div className="space-y-6">
+      {/* ── Import Panel ───────────────────────────────────────────────── */}
+      <section className="glass-card rounded-xl p-6 border border-sky-500/20">
+        <h2 className="font-serif text-xl font-bold text-white mb-1 flex items-center gap-2">
+          <Download className="w-5 h-5 text-sky-400" /> Import Cards — Eclipse API
+        </h2>
+        <p className="text-muted-foreground text-sm mb-6">
+          Fetch card data directly from the Eclipse Anime Card API. Images and videos are downloaded and stored locally.
+        </p>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-5">
-        <div>
-          <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Tier</label>
-          <select value={tier} onChange={(e) => setTier(e.target.value)}
-            className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50">
-            {VALID_TIERS.map((t) => <option key={t} value={t}>{t}</option>)}
-          </select>
+        {/* Mode tabs */}
+        <div className="flex gap-2 mb-5 flex-wrap">
+          {(["anime","event","tier","latest"] as const).map((m) => (
+            <button key={m} onClick={() => setImportMode(m)}
+              className={cn(
+                "px-4 py-1.5 rounded-lg border text-xs font-bold uppercase tracking-wider transition-colors",
+                importMode === m
+                  ? "bg-sky-500/20 border-sky-400/50 text-sky-300"
+                  : "bg-black/20 border-white/10 text-muted-foreground hover:border-white/20"
+              )}>
+              {m === "anime" ? "By Anime" : m === "event" ? "Events" : m === "tier" ? "By Tier" : "Latest"}
+            </button>
+          ))}
         </div>
-        <div>
-          <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Series Name</label>
-          <input type="text" value={series} onChange={(e) => setSeries(e.target.value)} placeholder="e.g. Anime, Shoob"
-            className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50 placeholder:text-muted-foreground" />
-        </div>
-        <div>
-          <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Limit (max 50)</label>
-          <input type="number" value={limit} onChange={(e) => setLimit(e.target.value)} min={1} max={50}
-            className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50" />
-        </div>
-        <div>
-          <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Page</label>
-          <input type="number" value={page} onChange={(e) => setPage(e.target.value)} min={1}
-            className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50" />
-        </div>
-      </div>
 
-      <button onClick={handleFetch} disabled={loading || !series.trim()}
-        className="px-6 py-2.5 rounded-lg bg-sky-500/20 border border-sky-400/40 text-sky-300 font-bold uppercase tracking-widest text-sm hover:bg-sky-500/30 transition-colors disabled:opacity-50 flex items-center gap-2">
-        {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
-        {loading ? "Importing…" : "Fetch & Import"}
-      </button>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-5">
+          {/* Anime mode */}
+          {importMode === "anime" && (
+            <>
+              <div>
+                <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Anime / Character Name</label>
+                <input type="text" value={anime} onChange={(e) => setAnime(e.target.value)} placeholder="e.g. Naruto, One Piece"
+                  className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50 placeholder:text-muted-foreground" />
+              </div>
+              <div>
+                <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Tier (optional)</label>
+                <select value={tier} onChange={(e) => setTier(e.target.value)}
+                  className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50">
+                  <option value="">All Tiers</option>
+                  {VALID_TIERS.map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+              </div>
+            </>
+          )}
 
-      {result && (
-        <div className={cn(
-          "mt-5 rounded-lg p-4 border text-sm",
-          result.success ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300" : "bg-rose-500/10 border-rose-500/30 text-rose-300"
-        )}>
-          <p className="font-bold mb-1">{result.success ? "✅ Done" : "❌ Failed"}</p>
-          <p>{result.message}</p>
-          {result.success && (
-            <div className="mt-2 flex gap-4 text-xs">
-              <span>🎴 Imported: <strong>{result.imported}</strong></span>
-              <span>⏭️ Skipped: <strong>{result.skipped}</strong></span>
+          {/* Event mode */}
+          {importMode === "event" && (
+            <div>
+              <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Event</label>
+              <select value={eventName} onChange={(e) => setEventName(e.target.value)}
+                className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50">
+                {EVENT_OPTIONS.map((ev) => <option key={ev} value={ev}>{ev}</option>)}
+              </select>
             </div>
           )}
-          {result.errors?.length > 0 && (
-            <div className="mt-2 text-xs text-rose-400">
-              <p className="font-semibold mb-1">Media errors:</p>
-              {result.errors.map((e: string, i: number) => <p key={i} className="font-mono">• {e}</p>)}
+
+          {/* Tier mode */}
+          {importMode === "tier" && (
+            <div>
+              <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Tier</label>
+              <select value={tier} onChange={(e) => setTier(e.target.value)}
+                className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50">
+                {VALID_TIERS.map((t) => <option key={t} value={t}>{t}</option>)}
+              </select>
             </div>
           )}
-        </div>
-      )}
 
-      <div className="mt-6 p-4 rounded-lg bg-black/20 border border-white/5 text-xs text-muted-foreground space-y-1">
-        <p className="font-bold text-white/60 uppercase tracking-wider mb-2">Bot Command Alternative</p>
-        <p>You can also import via bot: <code className="text-sky-300">.fetchshoob T3 Anime 20</code></p>
-        <p>Arguments: <code className="text-white/40">[tier] [series] [limit]</code></p>
-        <p>Video cards (mp4/webm) are auto-detected and stored as animated — assign them to animated tiers (T6, TS, TX, TZ).</p>
-        <p>Image cards are resized and compressed automatically to save storage.</p>
-      </div>
-    </section>
+          {/* Series override (all modes except latest) */}
+          {importMode !== "latest" && (
+            <div>
+              <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Series Override (optional)</label>
+              <input type="text" value={series} onChange={(e) => setSeries(e.target.value)} placeholder="Leave blank to use API value"
+                className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50 placeholder:text-muted-foreground" />
+            </div>
+          )}
+
+          {/* Limit (all modes) */}
+          <div>
+            <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Limit (max 200)</label>
+            <input type="number" value={limit} onChange={(e) => setLimit(e.target.value)} min={1} max={200}
+              className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50" />
+          </div>
+        </div>
+
+        <button onClick={handleImport} disabled={loading || (importMode === "anime" && !anime.trim())}
+          className="px-6 py-2.5 rounded-lg bg-sky-500/20 border border-sky-400/40 text-sky-300 font-bold uppercase tracking-widest text-sm hover:bg-sky-500/30 transition-colors disabled:opacity-50 flex items-center gap-2">
+          {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+          {loading ? "Importing…" : "Fetch & Import"}
+        </button>
+
+        {result && (
+          <div className={cn(
+            "mt-5 rounded-lg p-4 border text-sm",
+            result.success ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300" : "bg-rose-500/10 border-rose-500/30 text-rose-300"
+          )}>
+            <p className="font-bold mb-1">{result.success ? "✅ Done" : "❌ Failed"}</p>
+            <p>{result.message}</p>
+            {result.success && (
+              <div className="mt-2 flex gap-4 text-xs">
+                <span>🎴 Imported: <strong>{result.imported}</strong></span>
+                <span>⏭️ Skipped: <strong>{result.skipped}</strong></span>
+                <span>📊 Available: <strong>{result.total_available}</strong></span>
+              </div>
+            )}
+            {result.errors?.length > 0 && (
+              <div className="mt-2 text-xs text-rose-400">
+                <p className="font-semibold mb-1">Media errors:</p>
+                {result.errors.map((e: string, i: number) => <p key={i} className="font-mono">• {e}</p>)}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="mt-6 p-4 rounded-lg bg-black/20 border border-white/5 text-xs text-muted-foreground space-y-1">
+          <p className="font-bold text-white/60 uppercase tracking-wider mb-2">Bot Commands</p>
+          <p><code className="text-sky-300">.fetchcards T5 Naruto 30</code> — import Naruto T5 cards</p>
+          <p><code className="text-sky-300">.fetchcards event Christmas 20</code> — import Christmas event cards</p>
+          <p><code className="text-sky-300">.fetchcards latest 40</code> — import 40 latest scraped cards</p>
+          <p className="pt-1">TS/TX/TZ cards must be uploaded manually via the upload panel.</p>
+        </div>
+      </section>
+
+      {/* ── Scraper Status Panel ───────────────────────────────────────── */}
+      <section className="glass-card rounded-xl p-6 border border-violet-500/20">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="font-serif text-xl font-bold text-white flex items-center gap-2">
+            <RefreshCw className="w-5 h-5 text-violet-400" /> Scraper Status
+          </h2>
+          <div className="flex gap-2">
+            <button onClick={fetchScraperStatus} disabled={scraperLoading}
+              className="px-3 py-1.5 rounded-lg bg-violet-500/10 border border-violet-400/30 text-violet-300 text-xs font-bold uppercase tracking-wider hover:bg-violet-500/20 transition-colors disabled:opacity-50 flex items-center gap-1.5">
+              {scraperLoading ? <RefreshCw className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+              Refresh
+            </button>
+            <button onClick={triggerScraperRun} disabled={runLoading}
+              className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-400/30 text-emerald-300 text-xs font-bold uppercase tracking-wider hover:bg-emerald-500/20 transition-colors disabled:opacity-50 flex items-center gap-1.5">
+              {runLoading ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+              Run Scraper
+            </button>
+          </div>
+        </div>
+
+        {scraperStatus ? (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {scraperStatus.status && (
+                <div className="bg-black/20 rounded-lg p-3 border border-white/5 text-center">
+                  <p className="text-[9px] uppercase tracking-widest text-muted-foreground mb-1">Status</p>
+                  <p className={cn("text-sm font-bold", scraperStatus.status === "running" ? "text-emerald-400" : "text-amber-400")}>{scraperStatus.status}</p>
+                </div>
+              )}
+              {scraperStatus.total_cards !== undefined && (
+                <div className="bg-black/20 rounded-lg p-3 border border-white/5 text-center">
+                  <p className="text-[9px] uppercase tracking-widest text-muted-foreground mb-1">Total Cards</p>
+                  <p className="text-sm font-bold text-sky-400">{scraperStatus.total_cards?.toLocaleString()}</p>
+                </div>
+              )}
+              {scraperStatus.total_series !== undefined && (
+                <div className="bg-black/20 rounded-lg p-3 border border-white/5 text-center">
+                  <p className="text-[9px] uppercase tracking-widest text-muted-foreground mb-1">Series</p>
+                  <p className="text-sm font-bold text-violet-400">{scraperStatus.total_series?.toLocaleString()}</p>
+                </div>
+              )}
+              {scraperStatus.last_run && (
+                <div className="bg-black/20 rounded-lg p-3 border border-white/5 text-center">
+                  <p className="text-[9px] uppercase tracking-widest text-muted-foreground mb-1">Last Run</p>
+                  <p className="text-xs font-mono text-muted-foreground">{new Date(scraperStatus.last_run).toLocaleString()}</p>
+                </div>
+              )}
+            </div>
+            {Object.keys(scraperStatus).length > 0 && (
+              <pre className="text-[10px] font-mono text-muted-foreground bg-black/20 rounded p-3 border border-white/5 overflow-x-auto">
+                {JSON.stringify(scraperStatus, null, 2)}
+              </pre>
+            )}
+          </div>
+        ) : (
+          <p className="text-muted-foreground text-sm">Click Refresh to load scraper status from the Eclipse API.</p>
+        )}
+
+        {scraperHistory.length > 0 && (
+          <div className="mt-4">
+            <p className="text-xs uppercase tracking-widest text-muted-foreground mb-2">Recent Scraper History</p>
+            <div className="space-y-1 max-h-40 overflow-y-auto">
+              {scraperHistory.slice(0, 10).map((h: any, i: number) => (
+                <div key={i} className="flex items-center justify-between text-xs bg-black/20 rounded px-3 py-1.5 border border-white/5">
+                  <span className="font-mono text-muted-foreground">{h.timestamp ? new Date(h.timestamp).toLocaleString() : `Run ${i + 1}`}</span>
+                  <span className={cn("font-bold", h.success !== false ? "text-emerald-400" : "text-rose-400")}>
+                    {h.cards_added !== undefined ? `+${h.cards_added} cards` : (h.status || "OK")}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </section>
+    </div>
   );
 }
 
