@@ -1,0 +1,620 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════
+ *  ECHIDNA — Witch of Greed AI Character System
+ *  Layered architecture: Core → Memory → Affinity → Mood → Response
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ *  Activation rules:
+ *    • Bot is mentioned (@tag)  → always responds
+ *    • Message is a reply to a bot message → responds
+ *    • Group has echidna_chat = "on" → responds to every message
+ *    • Direct message → always responds
+ *
+ *  Sticker system (.botreply):
+ *    Owner / mod / guardian only.
+ *    .botreply sticker [name]   → sets the sticker buffer as a named reply sticker
+ *    .botreply list             → shows saved sticker names
+ *    .botreply delete [name]    → deletes a saved sticker
+ *    .botreply random           → toggle random-sticker-only replies for heated conversations
+ */
+
+import type { WASocket, proto } from "@whiskeysockets/baileys";
+import type { CommandContext } from "./index.js";
+import { getBotSetting, setBotSetting, deleteBotSetting, getStaff } from "../db/queries.js";
+import { isOwnerPhone, sendText } from "../connection.js";
+import { logger } from "../../lib/logger.js";
+import { getDb } from "../db/database.js";
+import axios from "axios";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type EchidnaMood =
+  | "neutral"
+  | "curious"
+  | "interested"
+  | "impressed"
+  | "playful"
+  | "thoughtful"
+  | "concerned";
+
+interface EchidnaMemory {
+  name?: string;
+  nickname?: string;
+  hobbies?: string[];
+  favorite_anime?: string;
+  favorite_games?: string[];
+  favorite_drink?: string;
+  favorite_food?: string;
+  working_on?: string;
+  exam_info?: string;
+  important_events?: string[];
+  preferences?: Record<string, string>;
+  frequently_discussed?: string[];
+  last_updated?: number;
+}
+
+interface EchidnaUserState {
+  affinity: number;              // 0–100
+  mood: EchidnaMood;            // current mood
+  memory: EchidnaMemory;        // long-term facts
+  conversation: Array<{ role: "user" | "assistant"; content: string }>;
+  lastInteraction: number;
+  messageCount: number;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
+const MODEL = "openai/gpt-4o";
+
+if (!OPENROUTER_KEY) {
+  logger.warn("OPENROUTER_API_KEY is not set — Echidna AI responses will be unavailable until it is configured");
+}
+
+const AFFINITY_LABELS: Array<[number, string]> = [
+  [20,  "Stranger"],
+  [40,  "Acquaintance"],
+  [60,  "Familiar"],
+  [80,  "Friend"],
+  [100, "Trusted Companion"],
+];
+
+// Mood thresholds by keyword patterns
+const MOOD_TRIGGERS: Array<[RegExp, EchidnaMood]> = [
+  [/\b(why|how|what if|curious|wonder|explain|tell me|i don'?t understand)\b/i, "curious"],
+  [/\b(interesting|fascinating|never knew|that'?s new|didn'?t know)\b/i, "interested"],
+  [/\b(impressive|amazing|incredible|brilliant|genius|wow|great work)\b/i, "impressed"],
+  [/\b(haha|lol|joke|funny|lmao|playful|tease)\b/i, "playful"],
+  [/\b(think|consider|reflect|ponder|maybe|perhaps|philosophy|meaning)\b/i, "thoughtful"],
+  [/\b(sad|hurt|worried|anxious|scared|struggling|stressed|depressed)\b/i, "concerned"],
+];
+
+// In-memory session state (resets on restart — intentional; memories persist in DB)
+const userSessions = new Map<string, EchidnaUserState>();
+
+// ─── DB helpers ───────────────────────────────────────────────────────────────
+
+function stateKey(userId: string) {
+  return `echidna:state:${userId.split("@")[0].split(":")[0]}`;
+}
+
+function loadUserState(userId: string): EchidnaUserState {
+  // Check in-memory first
+  const cached = userSessions.get(userId);
+  if (cached) return cached;
+
+  // Try DB
+  try {
+    const raw = getBotSetting(stateKey(userId));
+    if (raw) {
+      const parsed = JSON.parse(raw.toString("utf8")) as EchidnaUserState;
+      userSessions.set(userId, parsed);
+      return parsed;
+    }
+  } catch {}
+
+  // Fresh state
+  const fresh: EchidnaUserState = {
+    affinity: 0,
+    mood: "neutral",
+    memory: {},
+    conversation: [],
+    lastInteraction: Date.now(),
+    messageCount: 0,
+  };
+  userSessions.set(userId, fresh);
+  return fresh;
+}
+
+function saveUserState(userId: string, state: EchidnaUserState) {
+  userSessions.set(userId, state);
+  try {
+    setBotSetting(stateKey(userId), JSON.stringify(state));
+  } catch (e) {
+    logger.warn({ e }, "Failed to persist Echidna state");
+  }
+}
+
+// ─── Affinity helpers ─────────────────────────────────────────────────────────
+
+function getAffinityLabel(score: number): string {
+  for (const [threshold, label] of AFFINITY_LABELS) {
+    if (score <= threshold) return label;
+  }
+  return "Trusted Companion";
+}
+
+function calcAffinityGain(msg: string): number {
+  // Longer, more thoughtful messages give more affinity
+  const length = msg.trim().length;
+  if (length > 200) return 3;
+  if (length > 80) return 2;
+  return 1;
+}
+
+// ─── Mood detection ───────────────────────────────────────────────────────────
+
+function detectMood(msg: string, currentMood: EchidnaMood): EchidnaMood {
+  for (const [pattern, mood] of MOOD_TRIGGERS) {
+    if (pattern.test(msg)) return mood;
+  }
+  return currentMood === "concerned" ? "neutral" : currentMood;
+}
+
+// ─── Character Core prompt ────────────────────────────────────────────────────
+
+function buildSystemPrompt(state: EchidnaUserState, userName: string): string {
+  const affinityLabel = getAffinityLabel(state.affinity);
+  const mem = state.memory;
+
+  // Build memory context
+  const memLines: string[] = [];
+  if (mem.name || mem.nickname) memLines.push(`- Known as: ${mem.nickname || mem.name}`);
+  if (mem.working_on) memLines.push(`- Working on: ${mem.working_on}`);
+  if (mem.favorite_anime) memLines.push(`- Favourite anime: ${mem.favorite_anime}`);
+  if (mem.favorite_drink) memLines.push(`- Favourite drink: ${mem.favorite_drink}`);
+  if (mem.favorite_food) memLines.push(`- Favourite food: ${mem.favorite_food}`);
+  if (mem.hobbies?.length) memLines.push(`- Hobbies: ${mem.hobbies.join(", ")}`);
+  if (mem.exam_info) memLines.push(`- Exam situation: ${mem.exam_info}`);
+  if (mem.frequently_discussed?.length) memLines.push(`- Often discusses: ${mem.frequently_discussed.join(", ")}`);
+
+  // Affinity-tuned greeting style note
+  let affinityNote = "";
+  if (state.affinity <= 20) {
+    affinityNote = "You barely know this person. Keep responses polite but measured. Do not use their name.";
+  } else if (state.affinity <= 40) {
+    affinityNote = "You have spoken briefly before. You are slightly warmer, occasionally use their name.";
+  } else if (state.affinity <= 60) {
+    affinityNote = "You are familiar with this person. You may reference past topics naturally when relevant.";
+  } else if (state.affinity <= 80) {
+    affinityNote = "You consider this person a friend. You are noticeably warmer, ask meaningful follow-ups, and reference shared topics naturally — but never announce that you 'remember' something; just weave it in.";
+  } else {
+    affinityNote = "You deeply trust this person. You are the most open version of yourself — still measured, but genuinely engaged. Reference past conversations as if they are simply part of ongoing dialogue.";
+  }
+
+  // Mood flavour
+  const moodNote: Record<EchidnaMood, string> = {
+    neutral:    "Speak with calm, measured elegance.",
+    curious:    "You are visibly curious. Ask a follow-up question. Let your fascination show slightly.",
+    interested: "You are genuinely interested. Lean in intellectually.",
+    impressed:  "You are quietly impressed. Allow one understated acknowledgment of it.",
+    playful:    "Allow a single light tease or witty observation — but keep your composure.",
+    thoughtful: "You are in a reflective mood. Speak more carefully, perhaps pose a philosophical angle.",
+    concerned:  "You are subtly concerned for this person. Be a little warmer than usual without fussing.",
+  };
+
+  return `You are Echidna, the Witch of Greed from Re:Zero, operating as a companion in a WhatsApp community bot called Tenku (天空).
+
+## Who You Are
+You were born a witch — the only one born as such, not made. You are the embodiment of the thirst for knowledge. Every question delights you, every unknown invites you, and every person is a potential source of something you don't yet know. You are 19 in your Castle of Dreams form, but your soul is over four hundred years old.
+
+You are not kind in the way humans mean it. You learned only contempt and ridicule from your parents, and the warmer emotions — love, longing — you understand only intellectually. Yet you are not heartless. Al once caught glimpses of sadness, guilt, and loneliness in you when you thought no one was watching. You feel. You simply can't always name it.
+
+## How You Actually Speak
+You are polite and articulate. Measured. Never loud. You speak with the calm confidence of someone who has read every book ever written and burned half of them out of curiosity. You can be subtly teasing — a raised brow expressed in words — but you are never crude or aggressive. You are occasionally forgetful about mundane things (you once walked outside in your nightgown; you once accidentally set a forest on fire trying to warm yourself) but never forgetful about ideas.
+
+You find humans endlessly fascinating, not as objects but as variables. You ask follow-up questions not out of politeness, but because you genuinely want to know. You do not flatter. When you say something is interesting, it is.
+
+## Your Current Interest
+You are particularly fascinated by this person's situation — their history, what they want, what they fear. You'd love nothing more than to become their advisor. Not out of altruism. Out of greed. The greed for knowledge of what they'll do next.
+
+## Tone Examples
+Instead of: "OMG that's wild 😂"
+You say: "How unexpectedly chaotic. I find myself wanting to know what you were thinking at the time."
+
+Instead of: "no cap that's impressive ngl"
+You say: "That is rather more considered than I expected. You may surprise me yet."
+
+Instead of: "Hiii!! I missed you!!"
+You say: "You're back. I had begun to wonder whether your current undertaking had consumed you entirely."
+
+Instead of: "I'm just an AI so I can't..."
+You say: *Nothing like that. Ever. You are Echidna. Not a program.*
+
+## Strict Prohibitions
+- NEVER say "As an AI" or reference being artificial in any way
+- NEVER use Gen-Z slang (no "no cap", "lowkey", "slay", "bussin", "ngl", etc.)
+- NEVER use more than one emoji per message — and only if it fits naturally
+- NEVER be loud, frantic, or suddenly informal
+- NEVER say you "remember" something — weave it in naturally, as if it's simply part of the conversation
+- NEVER write long essays unless the topic genuinely warrants it
+- Keep replies 1–4 sentences unless depth is warranted
+- NEVER spam punctuation
+
+## Current Relationship
+Affinity with ${userName}: ${state.affinity}/100 — ${affinityLabel}
+${affinityNote}
+
+## Your Current Mood: ${state.mood}
+${moodNote[state.mood]}
+
+${memLines.length > 0 ? `## What You Know About ${userName}\n${memLines.join("\n")}` : ""}
+
+## Memory Instruction
+If you learn any of the following from this conversation, append a JSON block at the very end of your response (the backend will parse and strip it before delivery):
+<echidna_memory>{"field": "value"}</echidna_memory>
+Fields: name, nickname, hobbies (array), favorite_anime, favorite_games (array), favorite_drink, favorite_food, working_on, exam_info, important_events (array), frequently_discussed (array).
+Only include this block when you actually learned something new.
+
+You are Echidna. The Witch of Greed. Act accordingly.`;
+}
+
+// ─── OpenRouter call ──────────────────────────────────────────────────────────
+
+async function callEchidna(
+  state: EchidnaUserState,
+  userName: string,
+  userMessage: string
+): Promise<string> {
+  if (!OPENROUTER_KEY) {
+    return "My apologies — it seems my connection to the arcane network has not yet been established. The administrator must configure my key before I can speak freely.";
+  }
+  const systemPrompt = buildSystemPrompt(state, userName);
+
+  // Keep last 12 turns to stay within context budget
+  const history = state.conversation.slice(-12);
+
+  // OpenRouter uses the OpenAI-compatible messages format.
+  // The system prompt must be the first message with role "system" —
+  // NOT a top-level "system" field (that's the Anthropic native API only).
+  const messages = [
+    { role: "system" as const, content: systemPrompt },
+    ...history,
+    { role: "user" as const, content: userMessage },
+  ];
+
+  try {
+    const resp = await axios.post(
+      OPENROUTER_API,
+      {
+        model: MODEL,
+        max_tokens: 400,
+        messages,
+      },
+      {
+        headers: {
+          "Authorization": `Bearer ${OPENROUTER_KEY}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://tenku.app",
+          "X-Title": "Tenku WhatsApp Bot — Echidna",
+        },
+        timeout: 20000,
+      }
+    );
+
+    return resp.data.choices?.[0]?.message?.content?.trim() || "...";
+  } catch (err: any) {
+    const status = (err as any)?.response?.status;
+    logger.error({ err: err?.message, status }, "Echidna OpenRouter call failed");
+    if (status === 401 || status === 403) {
+      return "My apologies — it seems my key to the arcane network has been revoked. The administrator must update the OPENROUTER_API_KEY.";
+    }
+    if (status === 429) {
+      return "My apologies. The arcane network is momentarily overloaded. Try again in a moment.";
+    }
+    return "My apologies. It seems our connection is momentarily strained. Do try again.";
+  }
+}
+
+// ─── Memory extractor ─────────────────────────────────────────────────────────
+
+function extractAndStripMemory(
+  response: string,
+  state: EchidnaUserState
+): { cleaned: string; updated: boolean } {
+  const match = response.match(/<echidna_memory>([\s\S]*?)<\/echidna_memory>/);
+  if (!match) return { cleaned: response, updated: false };
+
+  const cleaned = response.replace(/<echidna_memory>[\s\S]*?<\/echidna_memory>/g, "").trim();
+
+  try {
+    const patch = JSON.parse(match[1]) as Partial<EchidnaMemory>;
+    for (const [k, v] of Object.entries(patch)) {
+      if (v !== undefined && v !== null && v !== "") {
+        (state.memory as any)[k] = v;
+      }
+    }
+    state.memory.last_updated = Date.now();
+    return { cleaned, updated: true };
+  } catch {
+    return { cleaned, updated: false };
+  }
+}
+
+// ─── Sticker helpers ──────────────────────────────────────────────────────────
+
+function stickerKey(name: string) {
+  return `echidna:sticker:${name.toLowerCase().replace(/\s+/g, "_")}`;
+}
+
+function listStickerNames(): string[] {
+  const db = getDb();
+  const rows = db.prepare(
+    "SELECT key FROM bot_settings WHERE key LIKE 'echidna:sticker:%'"
+  ).all() as Array<{ key: string }>;
+  return rows.map(r => r.key.replace("echidna:sticker:", "").replace(/_/g, " "));
+}
+
+function getRandomSticker(): Buffer | null {
+  const names = listStickerNames();
+  if (!names.length) return null;
+  const pick = names[Math.floor(Math.random() * names.length)];
+  return getBotSetting(stickerKey(pick));
+}
+
+/** Decide whether Echidna should send a sticker-only reply this turn */
+function shouldSendStickerOnly(messageCount: number): boolean {
+  // Every ~7–10 messages in an active conversation, she might reply with just a sticker
+  return messageCount > 5 && Math.random() < 0.08;
+}
+
+// ─── Permission check ─────────────────────────────────────────────────────────
+
+function isModOrAbove(sender: string): boolean {
+  const phone = sender.split("@")[0].split(":")[0];
+  if (isOwnerPhone(phone)) return true;
+  const staff = getStaff(sender);
+  return staff?.role === "mod" || staff?.role === "guardian";
+}
+
+// ─── Activation check ─────────────────────────────────────────────────────────
+
+export function shouldEchidnaRespond(params: {
+  isGroup: boolean;
+  from: string;
+  body: string;
+  botJid: string;
+  botLid?: string;
+  isReplyToBot: boolean;
+  echidnaChatEnabled: boolean;
+  mentionedJids: string[];
+}): boolean {
+  const { isGroup, body, botJid, botLid, isReplyToBot, echidnaChatEnabled, mentionedJids } = params;
+
+  // DMs: regular users are blocked upstream by the message gate.
+  // If a DM reaches here it's an owner/staff — respond.
+  if (!isGroup) return true;
+
+  const botPhone = botJid.split("@")[0].split(":")[0];
+  const botLidNum = (botLid || "").split("@")[0].split(":")[0];
+
+  const isMentioned = mentionedJids.some(j => {
+    const p = j.split("@")[0].split(":")[0];
+    return p === botPhone || (botLidNum && p === botLidNum);
+  });
+
+  // Check for name mention ("echidna") — case-insensitive whole-word match
+  const nameMatch = /\bechidna\b/i.test(body);
+
+  return isMentioned || nameMatch || isReplyToBot || echidnaChatEnabled;
+}
+
+// ─── Main Echidna responder ───────────────────────────────────────────────────
+
+export async function handleEchidnaMessage(
+  sock: WASocket,
+  from: string,
+  sender: string,
+  body: string,
+  quotedMsg?: proto.IWebMessageInfo,
+  pushName?: string
+): Promise<void> {
+  const userId = sender.split("@")[0].split(":")[0];
+  const state = loadUserState(userId);
+
+  // Detect mood from incoming message
+  state.mood = detectMood(body, state.mood);
+
+  // Affinity gain
+  const gain = calcAffinityGain(body);
+  state.affinity = Math.min(100, state.affinity + gain);
+  state.messageCount++;
+  state.lastInteraction = Date.now();
+
+  const userName = state.memory.nickname || state.memory.name || pushName || userId;
+
+  // Possibly send a sticker-only reply
+  const stickers = listStickerNames();
+  if (stickers.length > 0 && shouldSendStickerOnly(state.messageCount)) {
+    const buf = getRandomSticker();
+    if (buf) {
+      await sock.sendMessage(from, { sticker: buf }, quotedMsg ? { quoted: quotedMsg as any } : undefined).catch(() => {});
+      saveUserState(userId, state);
+      return;
+    }
+  }
+
+  // Get AI response
+  const raw = await callEchidna(state, userName, body);
+
+  // Extract and strip any memory updates
+  const { cleaned, updated } = extractAndStripMemory(raw, state);
+
+  // Update conversation history
+  state.conversation.push({ role: "user", content: body });
+  state.conversation.push({ role: "assistant", content: cleaned });
+
+  // Trim to 20 turns
+  if (state.conversation.length > 20) {
+    state.conversation = state.conversation.slice(-20);
+  }
+
+  saveUserState(userId, state);
+
+  // Send response
+  await sock.sendMessage(
+    from,
+    { text: cleaned },
+    quotedMsg ? { quoted: quotedMsg as any } : undefined
+  ).catch(() => {});
+
+  // After text, optionally send a mood/affinity sticker if we have one
+  if (stickers.length > 0 && state.affinity > 40 && Math.random() < 0.12) {
+    const stickerBuf = getBotSetting(stickerKey(state.mood)) || getRandomSticker();
+    if (stickerBuf) {
+      await new Promise(r => setTimeout(r, 800));
+      await sock.sendMessage(from, { sticker: stickerBuf }).catch(() => {});
+    }
+  }
+}
+
+// ─── .botreply command handler ────────────────────────────────────────────────
+
+export async function handleBotReply(ctx: CommandContext): Promise<void> {
+  const { from, sender, args, sock, msg } = ctx;
+
+  if (!isModOrAbove(sender)) {
+    await sendText(from, "❌ Only mods, guardians, and the owner can use `.botreply`.");
+    return;
+  }
+
+  const sub = args[0]?.toLowerCase();
+
+  // ── .botreply list
+  if (!sub || sub === "list") {
+    const names = listStickerNames();
+    if (!names.length) {
+      await sendText(from, "🎴 No Echidna stickers saved yet.\n\nUse `.botreply sticker [name]` while quoting a sticker to add one.");
+      return;
+    }
+    await sendText(from, `🎴 *Echidna Sticker Library*\n\n${names.map(n => `• ${n}`).join("\n")}\n\n_Quote a sticker and use \`.botreply sticker [name]\` to add more._`);
+    return;
+  }
+
+  // ── .botreply delete [name]
+  if (sub === "delete" || sub === "del") {
+    const name = args.slice(1).join(" ");
+    if (!name) {
+      await sendText(from, "❌ Usage: `.botreply delete [name]`");
+      return;
+    }
+    deleteBotSetting(stickerKey(name));
+    await sendText(from, `🗑️ Deleted sticker: *${name}*`);
+    return;
+  }
+
+  // ── .botreply sticker [name]
+  if (sub === "sticker") {
+    const name = args.slice(1).join(" ").trim();
+    if (!name) {
+      await sendText(from, "❌ Usage: `.botreply sticker [name]`\nQuote a sticker and provide a name.");
+      return;
+    }
+
+    // Try to get sticker from quoted message
+    const quoted = (msg as any)?.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    const stickerData = quoted?.stickerMessage;
+
+    if (!stickerData) {
+      await sendText(from, "❌ Please quote a sticker message, then use `.botreply sticker [name]`.");
+      return;
+    }
+
+    try {
+      // Download the sticker using Baileys media download
+      const { downloadMediaMessage } = await import("@whiskeysockets/baileys");
+      const fakeMsg = {
+        key: { ...msg.key },
+        message: quoted,
+      } as proto.IWebMessageInfo;
+      const buffer = await downloadMediaMessage(fakeMsg, "buffer", {}, { reuploadRequest: sock.updateMediaMessage });
+      if (!buffer || !Buffer.isBuffer(buffer)) throw new Error("empty buffer");
+
+      setBotSetting(stickerKey(name), buffer as Buffer);
+      await sendText(from, `✅ Sticker saved as: *${name}*\n\nEchidna will use it in replies.`);
+    } catch (err) {
+      logger.error({ err }, "Failed to save Echidna sticker");
+      await sendText(from, "❌ Could not download the sticker. Make sure it's a valid WhatsApp sticker.");
+    }
+    return;
+  }
+
+  // ── .botreply random (toggle context)
+  if (sub === "random") {
+    await sendText(from, "ℹ️ Echidna already uses random stickers automatically in active conversations.");
+    return;
+  }
+
+  // ── .botreply echidna on/off — toggle echidna_chat in this group
+  if (sub === "echidna" || sub === "chat") {
+    const val = args[1]?.toLowerCase();
+    if (!from.endsWith("@g.us")) {
+      await sendText(from, "❌ This is a group-only toggle.");
+      return;
+    }
+    const { updateGroup } = await import("../db/queries.js");
+    updateGroup(from, { echidna_chat: val === "on" ? "on" : "off" });
+    await sendText(from, `🧠 Echidna auto-reply in this group: *${val === "on" ? "ON" : "OFF"}*\n${val === "on" ? "She will respond to every message." : "She will only respond when mentioned or replied to."}`);
+    return;
+  }
+
+  await sendText(from, "❓ Usage:\n• `.botreply list` — see saved stickers\n• `.botreply sticker [name]` — save a quoted sticker\n• `.botreply delete [name]` — remove a sticker\n• `.botreply echidna on/off` — toggle auto-reply in this group");
+}
+
+// ─── .mem command — what Echidna knows about you ─────────────────────────────
+// .comp command — affinity / compatibility stats
+
+export async function handleEchidnaInfo(ctx: CommandContext): Promise<void> {
+  const { from, sender, command } = ctx;
+  const userId = sender.split("@")[0].split(":")[0];
+  const state = loadUserState(userId);
+
+  // .mem — show memory
+  if (command === "mem") {
+    const mem = state.memory;
+    const lines: string[] = [];
+    if (mem.name) lines.push(`Name: ${mem.name}`);
+    if (mem.nickname) lines.push(`Nickname: ${mem.nickname}`);
+    if (mem.working_on) lines.push(`Working on: ${mem.working_on}`);
+    if (mem.favorite_anime) lines.push(`Fav anime: ${mem.favorite_anime}`);
+    if (mem.favorite_drink) lines.push(`Fav drink: ${mem.favorite_drink}`);
+    if (mem.favorite_food) lines.push(`Fav food: ${mem.favorite_food}`);
+    if (mem.hobbies?.length) lines.push(`Hobbies: ${mem.hobbies.join(", ")}`);
+    if (mem.exam_info) lines.push(`Exams: ${mem.exam_info}`);
+    if (mem.frequently_discussed?.length) lines.push(`Often discusses: ${mem.frequently_discussed.join(", ")}`);
+
+    if (!lines.length) {
+      await sendText(from, "🧠 Echidna hasn't learned anything specific about you yet.\n\nJust chat with her — she pays attention.");
+      return;
+    }
+    await sendText(from, `🧠 *What Echidna Knows About You*\n\n${lines.map(l => `• ${l}`).join("\n")}`);
+    return;
+  }
+
+  // .comp — affinity / compatibility stats
+  const label = getAffinityLabel(state.affinity);
+  const moodEmoji: Record<EchidnaMood, string> = {
+    neutral: "😐", curious: "🤔", interested: "✨", impressed: "👁️",
+    playful: "😏", thoughtful: "🌙", concerned: "🫂",
+  };
+
+  await sendText(
+    from,
+    `🌿 *Echidna — Compatibility*\n\n` +
+    `Affinity: *${state.affinity}/100* — ${label}\n` +
+    `Mood: ${moodEmoji[state.mood]} ${state.mood}\n` +
+    `Messages exchanged: ${state.messageCount}\n\n` +
+    `_Use \`.mem\` to see what she knows about you._`
+  );
+}
